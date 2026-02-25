@@ -127,6 +127,31 @@ Seriously. A physical sticky note on your monitor with 3-4 lines works. The medi
 
 ---
 
+---
+
+## Implementation: Networked Dashboard (Multi-Session)
+
+If you run multiple terminals/sessions in parallel (e.g., several PowerShell tabs each running Claude Code), the file-based approach doesn't scale — each session has its own context.
+
+The **Workstate Dashboard** is a tiny local web server that all sessions POST their status to. One browser tab shows everything:
+
+- All active sessions (your terminal tabs)
+- All subagents within each session (background tasks Claude Code spun up)
+- Staleness indicators (green/yellow/red dots)
+- Auto-refresh every 5 seconds
+
+```bash
+# Start the dashboard
+python tools/workstate-dashboard.py
+# Open http://localhost:7777
+```
+
+See [tools/workstate-dashboard.py](../tools/workstate-dashboard.py) for the server and [CLAUDE-dashboard-snippet.md](../claude-code/CLAUDE-dashboard-snippet.md) for the CLAUDE.md integration.
+
+Zero dependencies. Single Python file. Stdlib only.
+
+---
+
 ## The Key Insight
 
 The goal is not to track work more precisely. The goal is to **stop carrying state in your head** so your working memory is available for the actual problem you're solving.

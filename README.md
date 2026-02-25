@@ -36,11 +36,16 @@ Practical, implementable patterns for specific failure modes:
 
 - **[Workstate Tracking](patterns/workstate-tracking.md)** — Externalize parallel thread state to prevent invisible cognitive overload. Includes a Claude Code integration that auto-tracks your active workstreams.
 
+### [Tools](tools/)
+
+- **[Workstate Dashboard](tools/workstate-dashboard.py)** — Local web server that aggregates status from multiple Claude Code sessions. One browser tab shows all your terminal tabs and their subagents. Zero dependencies, stdlib only. `python tools/workstate-dashboard.py` and open `http://localhost:7777`.
+
 ### [Claude Code Integration](claude-code/)
 
 Ready-to-use snippets for [Claude Code](https://claude.ai/code) users:
 
-- **[CLAUDE.md Snippet](claude-code/CLAUDE-snippet.md)** — Copy-paste into your project for automatic workstate tracking
+- **[CLAUDE.md Snippet](claude-code/CLAUDE-snippet.md)** — Copy-paste into your project for automatic single-session workstate tracking
+- **[Dashboard Snippet](claude-code/CLAUDE-dashboard-snippet.md)** — Copy-paste for multi-session dashboard reporting
 - **[Workstate Template](claude-code/workstate-template.md)** — Empty state table template
 
 ## Philosophy
