@@ -16,6 +16,7 @@ Dashboard: http://localhost:7777
 import argparse
 import base64
 import json
+import os
 import threading
 import time
 from dataclasses import dataclass, field, asdict
@@ -266,6 +267,199 @@ def sweeper():
                 e for e in expired
                 if seconds_since(e.get("expired_at", now_iso())) < cutoff
             ]
+
+
+# ---------------------------------------------------------------------------
+# Claude Code session auto-detection
+# ---------------------------------------------------------------------------
+
+CLAUDE_PROJECTS_DIR = Path.home() / ".claude" / "projects"
+ACTIVE_THRESHOLD_SEC = 300  # sessions modified in last 5 min = active
+IDLE_THRESHOLD_SEC = 7200   # sessions modified in last 2 hours = idle
+AUTO_PREFIX = "auto-cc-"    # prefix for auto-detected session IDs
+
+
+def _project_label(dirname: str) -> str:
+    """Convert project dir name to a short label.
+    C--Users-gmcmillan-Desktop-AI-Projects-ACV-AI-Agent-gus-demo-r1 -> gus-demo-r1
+    """
+    parts = dirname.replace("C--", "").replace("c--", "").split("-")
+    # Take the last meaningful segments
+    # Find last segment that looks like a project name (skip Users, gmcmillan, Desktop, etc)
+    skip = {"users", "gmcmillan", "desktop", "ai", "projects", "acv", "agent"}
+    meaningful = [p for p in parts if p.lower() not in skip]
+    if meaningful:
+        return "-".join(meaningful[-3:])  # last 3 segments
+    return dirname[-30:]
+
+
+def _extract_last_user_message(jsonl_path: Path) -> str:
+    """Read the last user message from a JSONL transcript (read from end for speed)."""
+    try:
+        # Read last 200KB to find the last user message
+        size = jsonl_path.stat().st_size
+        read_bytes = min(size, 200_000)
+        with open(jsonl_path, "rb") as f:
+            if size > read_bytes:
+                f.seek(size - read_bytes)
+            chunk = f.read().decode("utf-8", errors="replace")
+
+        last_msg = ""
+        for line in chunk.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                d = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if d.get("type") != "user":
+                continue
+            msg = d.get("message", {})
+            content = ""
+            if isinstance(msg, dict):
+                c = msg.get("content", "")
+                if isinstance(c, list):
+                    for block in c:
+                        if isinstance(block, dict) and block.get("type") == "text":
+                            text = block.get("text", "").strip()
+                            # Skip system reminders
+                            if text and not text.startswith("<system-reminder>"):
+                                content = text
+                                break
+                elif isinstance(c, str):
+                    content = c.strip()
+            elif isinstance(msg, str):
+                content = msg.strip()
+            if content:
+                last_msg = content
+        return last_msg[:120] if last_msg else "Session active"
+    except Exception:
+        return "Session active"
+
+
+def _extract_first_user_message(jsonl_path: Path) -> str:
+    """Read the first user message from a JSONL transcript."""
+    try:
+        with open(jsonl_path, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    d = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if d.get("type") != "user":
+                    continue
+                msg = d.get("message", {})
+                content = ""
+                if isinstance(msg, dict):
+                    c = msg.get("content", "")
+                    if isinstance(c, list):
+                        for block in c:
+                            if isinstance(block, dict) and block.get("type") == "text":
+                                text = block.get("text", "").strip()
+                                if text and not text.startswith("<system-reminder>"):
+                                    content = text
+                                    break
+                    elif isinstance(c, str):
+                        content = c.strip()
+                elif isinstance(msg, str):
+                    content = msg.strip()
+                if content:
+                    return content[:80]
+        return "Claude Code"
+    except Exception:
+        return "Claude Code"
+
+
+def scan_claude_sessions():
+    """Scan ~/.claude/projects/ for active Claude Code sessions."""
+    if not CLAUDE_PROJECTS_DIR.exists():
+        return
+
+    now_ts = time.time()
+    detected = {}
+
+    try:
+        for proj_dir in CLAUDE_PROJECTS_DIR.iterdir():
+            if not proj_dir.is_dir():
+                continue
+            project_label = _project_label(proj_dir.name)
+
+            for jsonl in proj_dir.glob("*.jsonl"):
+                try:
+                    mtime = jsonl.stat().st_mtime
+                    age = now_ts - mtime
+                    if age > IDLE_THRESHOLD_SEC:
+                        continue
+
+                    sid = AUTO_PREFIX + jsonl.stem
+                    status = "Running" if age < ACTIVE_THRESHOLD_SEC else "Idle"
+                    last_msg = _extract_last_user_message(jsonl)
+                    first_msg = _extract_first_user_message(jsonl)
+
+                    # Use first message as session name, last message as current task
+                    name = first_msg if first_msg != "Claude Code" else project_label
+                    name = f"[{project_label}] {name}"
+
+                    detected[sid] = {
+                        "session_id": sid,
+                        "name": name,
+                        "task": last_msg,
+                        "status": status,
+                        "risk": "-",
+                        "mtime_iso": datetime.fromtimestamp(mtime, tz=timezone.utc).isoformat(),
+                    }
+                except Exception:
+                    continue
+    except Exception:
+        return
+
+    with lock:
+        # Update or create auto-detected sessions
+        for sid, info in detected.items():
+            if sid in sessions:
+                s = sessions[sid]
+                new_task = info["task"]
+                if new_task != s.task:
+                    s.history.append(s.task)
+                    if len(s.history) > MAX_HISTORY:
+                        s.history = s.history[-MAX_HISTORY:]
+                s.task = new_task
+                s.status = info["status"]
+                s.last_seen = info["mtime_iso"]
+            else:
+                sessions[sid] = Session(
+                    session_id=sid,
+                    name=info["name"],
+                    task=info["task"],
+                    status=info["status"],
+                    risk=info["risk"],
+                    started=info["mtime_iso"],
+                    last_seen=info["mtime_iso"],
+                )
+
+        # Remove auto-detected sessions that are no longer active
+        to_remove = []
+        for sid in sessions:
+            if sid.startswith(AUTO_PREFIX) and sid not in detected:
+                to_remove.append(sid)
+        for sid in to_remove:
+            s = sessions.pop(sid)
+            expired.append({
+                "name": s.name,
+                "last_task": s.task,
+                "expired_at": now_iso(),
+            })
+
+
+def session_scanner():
+    """Background thread that periodically scans for Claude Code sessions."""
+    while True:
+        scan_claude_sessions()
+        time.sleep(10)  # scan every 10 seconds
 
 
 # ---------------------------------------------------------------------------
@@ -758,6 +952,30 @@ def main():
     parser.add_argument("--logo-right", type=str, default="", help="Path to bottom-right logo image")
     args = parser.parse_args()
 
+    # Auto-load images from tools/images/ folder if no flags given
+    images_dir = Path(__file__).parent / "images"
+    if not args.logo and images_dir.exists():
+        for name in ("logo", "header"):
+            for ext in ("png", "jpg", "jpeg", "svg", "webp"):
+                candidate = images_dir / f"{name}.{ext}"
+                if candidate.exists():
+                    args.logo = str(candidate)
+                    break
+            if args.logo:
+                break
+    if not args.logo_left and images_dir.exists():
+        for ext in ("png", "jpg", "jpeg", "svg", "webp"):
+            candidate = images_dir / f"logo-left.{ext}"
+            if candidate.exists():
+                args.logo_left = str(candidate)
+                break
+    if not args.logo_right and images_dir.exists():
+        for ext in ("png", "jpg", "jpeg", "svg", "webp"):
+            candidate = images_dir / f"logo-right.{ext}"
+            if candidate.exists():
+                args.logo_right = str(candidate)
+                break
+
     if args.logo:
         LOGO_DATA_URI = load_logo(args.logo)
         if LOGO_DATA_URI:
@@ -771,9 +989,23 @@ def main():
         if LOGO_RIGHT_URI:
             print(f"Right logo loaded: {args.logo_right}")
 
+    if not any([LOGO_DATA_URI, LOGO_LEFT_URI, LOGO_RIGHT_URI]):
+        print(f"Tip: Drop images into {images_dir}/ to add logos:")
+        print(f"  logo.png       -> header logo")
+        print(f"  logo-left.png  -> bottom-left watermark")
+        print(f"  logo-right.png -> bottom-right watermark")
+
     # Start sweeper thread
     t = threading.Thread(target=sweeper, daemon=True)
     t.start()
+
+    # Start Claude Code session scanner
+    scanner = threading.Thread(target=session_scanner, daemon=True)
+    scanner.start()
+    print(f"Claude Code session scanner active (scanning {CLAUDE_PROJECTS_DIR})")
+
+    # Do initial scan immediately
+    scan_claude_sessions()
 
     server = ThreadingHTTPServer(("", args.port), DashboardHandler)
     print(f"Workstate Dashboard: http://localhost:{args.port}")
