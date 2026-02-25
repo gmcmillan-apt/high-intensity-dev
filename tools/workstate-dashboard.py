@@ -84,10 +84,10 @@ def staleness(last_seen):
         return "ok"
     elif age < STALE_SECONDS:
         return "warning"
-    elif age < EXPIRE_SECONDS:
-        return "stale"
     else:
-        return "expired"
+        # Sessions stay visible as "idle" — they never auto-expire.
+        # Only explicit Done/Delete removes a session.
+        return "idle"
 
 
 def relative_time(iso_str):
@@ -240,12 +240,12 @@ def sweeper():
     while True:
         time.sleep(30)
         with lock:
-            # Expire old sessions
-            to_expire = []
+            # Sessions NEVER auto-expire. Only explicit Done/Delete removes them.
+            # An idle session just means the user hasn't talked to that tab yet.
+
+            # Threads (subagents) DO auto-expire after EXPIRE_SECONDS —
+            # a silent subagent is probably dead.
             for sid, s in sessions.items():
-                if seconds_since(s.last_seen) > EXPIRE_SECONDS:
-                    to_expire.append(sid)
-                # Expire old threads within sessions
                 to_remove = []
                 for tid, t in s.threads.items():
                     if seconds_since(t.last_seen) > EXPIRE_SECONDS:
@@ -253,15 +253,7 @@ def sweeper():
                 for tid in to_remove:
                     del s.threads[tid]
 
-            for sid in to_expire:
-                s = sessions.pop(sid)
-                expired.append({
-                    "name": s.name,
-                    "last_task": s.task,
-                    "expired_at": now_iso(),
-                })
-
-            # Purge old expired entries
+            # Purge old expired entries (from Done/Delete) after PURGE_SECONDS
             cutoff = PURGE_SECONDS
             expired[:] = [
                 e for e in expired
@@ -432,8 +424,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   }
   .dot-ok { background: #3fb950; box-shadow: 0 0 6px #3fb95066; }
   .dot-warning { background: #d29922; box-shadow: 0 0 6px #d2992266; }
-  .dot-stale { background: #f85149; box-shadow: 0 0 6px #f8514966; }
-  .dot-expired { background: #484f58; }
+  .dot-idle { background: #484f58; box-shadow: 0 0 4px #484f5844; }
   .status {
     display: inline-block;
     padding: 2px 8px;
@@ -556,8 +547,8 @@ function statusClass(status) {
 function dotClass(staleness) {
   if (staleness === 'ok') return 'dot-ok';
   if (staleness === 'warning') return 'dot-warning';
-  if (staleness === 'stale') return 'dot-stale';
-  return 'dot-expired';
+  if (staleness === 'idle') return 'dot-idle';
+  return 'dot-idle';
 }
 
 function escapeHtml(text) {

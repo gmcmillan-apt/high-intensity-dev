@@ -97,5 +97,6 @@ curl -s -X POST http://localhost:7777/api/session \
 
 - **Session names matter.** The user glances at the dashboard and needs to instantly know which PS tab maps to which row. Use short, descriptive names.
 - **Don't over-report.** One POST per logical task transition is enough. Not every `git status` or file read.
-- **Threads auto-expire.** If a background agent crashes without reporting Done, the dashboard will mark it stale (yellow -> red) and eventually expire it.
+- **Sessions never auto-expire.** Idle sessions stay on the dashboard (gray dot) so the user remembers to check on them. Only explicit Done or Delete removes a session.
+- **Threads auto-expire.** If a background subagent crashes without reporting Done, it will be cleaned up after 10 minutes of silence.
 - **Dashboard is optional.** The `|| true` on every curl means this is purely additive. Sessions work identically with or without the dashboard running.

@@ -137,7 +137,8 @@ The **Workstate Dashboard** is a tiny local web server that all sessions POST th
 
 - All active sessions (your terminal tabs)
 - All subagents within each session (background tasks Claude Code spun up)
-- Staleness indicators (green/yellow/red dots)
+- Staleness indicators (green=active, yellow=warning, gray=idle)
+- Sessions never auto-expire — idle tabs stay visible so you remember to check on them
 - Auto-refresh every 5 seconds
 
 ```bash
