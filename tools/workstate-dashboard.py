@@ -24,8 +24,10 @@ from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 from urllib.parse import urlparse
 
-# Set at startup by --logo flag, empty string if no logo
-LOGO_DATA_URI = ""
+# Set at startup by --logo/--logo-left/--logo-right flags
+LOGO_DATA_URI = ""       # header logo (--logo)
+LOGO_LEFT_URI = ""       # bottom-left watermark (--logo-left)
+LOGO_RIGHT_URI = ""      # bottom-right watermark (--logo-right)
 
 
 # ---------------------------------------------------------------------------
@@ -325,6 +327,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
     def _serve_html(self):
         html = DASHBOARD_HTML.replace("{{LOGO_DATA_URI}}", LOGO_DATA_URI)
         html = html.replace("{{LOGO_DISPLAY}}", "block" if LOGO_DATA_URI else "none")
+        html = html.replace("{{LOGO_LEFT_URI}}", LOGO_LEFT_URI)
+        html = html.replace("{{LOGO_LEFT_DISPLAY}}", "block" if LOGO_LEFT_URI else "none")
+        html = html.replace("{{LOGO_RIGHT_URI}}", LOGO_RIGHT_URI)
+        html = html.replace("{{LOGO_RIGHT_DISPLAY}}", "block" if LOGO_RIGHT_URI else "none")
         body = html.encode()
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -534,6 +540,19 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     display: none;
   }
   .warn-banner.visible { display: block; }
+  .watermark {
+    position: fixed;
+    bottom: 24px;
+    pointer-events: none;
+    z-index: 999;
+  }
+  .watermark-right { right: 24px; }
+  .watermark-left { left: 24px; }
+  .watermark img {
+    width: 600px;
+    height: auto;
+    border-radius: 16px;
+  }
 </style>
 </head>
 <body>
@@ -548,6 +567,12 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   <div class="counts" id="counts"></div>
   <div id="content"></div>
   <div id="expired-section"></div>
+  <div class="watermark watermark-left" style="display:{{LOGO_LEFT_DISPLAY}}">
+    <img src="{{LOGO_LEFT_URI}}" alt="">
+  </div>
+  <div class="watermark watermark-right" style="display:{{LOGO_RIGHT_DISPLAY}}">
+    <img src="{{LOGO_RIGHT_URI}}" alt="">
+  </div>
 
 <script>
 const REFRESH_MS = 5000;
@@ -716,19 +741,29 @@ def load_logo(path_str):
 
 
 def main():
-    global LOGO_DATA_URI
+    global LOGO_DATA_URI, LOGO_LEFT_URI, LOGO_RIGHT_URI
 
     parser = argparse.ArgumentParser(
         description="Workstate Dashboard - local multi-session status aggregator"
     )
     parser.add_argument("--port", type=int, default=7777, help="Port (default: 7777)")
-    parser.add_argument("--logo", type=str, default="", help="Path to logo image file")
+    parser.add_argument("--logo", type=str, default="", help="Path to header logo image")
+    parser.add_argument("--logo-left", type=str, default="", help="Path to bottom-left logo image")
+    parser.add_argument("--logo-right", type=str, default="", help="Path to bottom-right logo image")
     args = parser.parse_args()
 
     if args.logo:
         LOGO_DATA_URI = load_logo(args.logo)
         if LOGO_DATA_URI:
-            print(f"Logo loaded: {args.logo}")
+            print(f"Header logo loaded: {args.logo}")
+    if args.logo_left:
+        LOGO_LEFT_URI = load_logo(args.logo_left)
+        if LOGO_LEFT_URI:
+            print(f"Left logo loaded: {args.logo_left}")
+    if args.logo_right:
+        LOGO_RIGHT_URI = load_logo(args.logo_right)
+        if LOGO_RIGHT_URI:
+            print(f"Right logo loaded: {args.logo_right}")
 
     # Start sweeper thread
     t = threading.Thread(target=sweeper, daemon=True)
