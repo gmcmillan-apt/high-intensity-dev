@@ -457,6 +457,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     letter-spacing: 0.3px;
   }
   .status-running { background: #23853320; color: #3fb950; border: 1px solid #23853350; }
+  .status-thinking { background: #8b5cf620; color: #a78bfa; border: 1px solid #8b5cf650; }
+  .status-idle { background: #21262d; color: #7d8590; border: 1px solid #30363d; }
+  .status-awaiting-approval { background: #d2992220; color: #d29922; border: 1px solid #d2992250; }
   .status-up { background: #1f6feb20; color: #58a6ff; border: 1px solid #1f6feb50; }
   .status-blocked { background: #9e6a0320; color: #d29922; border: 1px solid #9e6a0350; }
   .status-failed { background: #da363420; color: #f85149; border: 1px solid #da363450; }
@@ -580,8 +583,11 @@ const REFRESH_MS = 5000;
 function relativeSafe(s) { return s || '?'; }
 
 function statusClass(status) {
-  const s = (status || '').toLowerCase();
+  const s = (status || '').toLowerCase().replace(/\\s+/g, '-');
   if (s === 'running') return 'status-running';
+  if (s === 'thinking') return 'status-thinking';
+  if (s === 'idle') return 'status-idle';
+  if (s === 'awaiting-approval') return 'status-awaiting-approval';
   if (s === 'up') return 'status-up';
   if (s === 'blocked') return 'status-blocked';
   if (s === 'failed') return 'status-failed';

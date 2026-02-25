@@ -61,7 +61,9 @@ curl -s -X POST http://localhost:7777/api/session \
 
 **Session-level (task transitions):**
 - Starting a new logical unit of work ("Refactoring auth" -> "Writing tests")
-- Status changes (Blocked, Failed, Done)
+- Status changes (Running, Thinking, Idle, Awaiting Approval, Blocked, Failed, Done)
+- When waiting for user input -> set status to "Idle"
+- When a tool permission prompt is shown -> set status to "Awaiting Approval"
 - Risk detection (slow operation, conflict, error)
 
 **Thread-level (subagents):**
@@ -71,7 +73,16 @@ curl -s -X POST http://localhost:7777/api/session \
 
 ### Statuses
 
-Up | Running | Done | Blocked | Failed
+| Status | Meaning | When to use |
+|--------|---------|-------------|
+| **Running** | Actively executing work | Default during tool calls, edits, searches |
+| **Thinking** | Processing/reasoning before acting | Deep analysis, plan formulation, complex debugging |
+| **Idle** | Waiting for user input | Posed a question, awaiting approval, user hasn't responded |
+| **Awaiting Approval** | Blocked on user permission | Tool permission prompt, destructive action confirmation |
+| **Up** | Persistent process running | Servers, watchers, tunnels |
+| **Blocked** | Cannot proceed | Dependency issue, missing resource, waiting on external |
+| **Failed** | Errored out | Unrecoverable error, needs user attention |
+| **Done** | Session complete | User ended session, final task finished |
 
 ### Important
 
