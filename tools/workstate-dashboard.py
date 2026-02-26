@@ -374,6 +374,28 @@ def _extract_first_user_message(jsonl_path: Path) -> str:
         return "Claude Code"
 
 
+def _extract_slug(jsonl_path: Path) -> str:
+    """Extract the slug field from a subagent JSONL (scan first ~20 lines)."""
+    try:
+        with open(jsonl_path, "r", encoding="utf-8", errors="replace") as f:
+            for i, line in enumerate(f):
+                if i >= 20:
+                    break
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    d = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                slug = d.get("slug")
+                if slug:
+                    return slug
+    except Exception:
+        pass
+    return ""
+
+
 def scan_claude_sessions():
     """Scan ~/.claude/projects/ for active Claude Code sessions."""
     if not CLAUDE_PROJECTS_DIR.exists():
@@ -381,6 +403,7 @@ def scan_claude_sessions():
 
     now_ts = time.time()
     detected = {}
+    detected_threads = {}  # parent_sid -> {agent_id -> thread_info}
 
     try:
         for proj_dir in CLAUDE_PROJECTS_DIR.iterdir():
@@ -388,6 +411,7 @@ def scan_claude_sessions():
                 continue
             project_label = _project_label(proj_dir.name)
 
+            # Pass 1: scan top-level JSONL files (parent sessions)
             for jsonl in proj_dir.glob("*.jsonl"):
                 try:
                     mtime = jsonl.stat().st_mtime
@@ -414,6 +438,44 @@ def scan_claude_sessions():
                     }
                 except Exception:
                     continue
+
+            # Pass 2: scan subagent JSONL files (nested under parent UUID dirs)
+            for sub_dir in proj_dir.iterdir():
+                if not sub_dir.is_dir():
+                    continue
+                subagents_dir = sub_dir / "subagents"
+                if not subagents_dir.is_dir():
+                    continue
+
+                parent_uuid = sub_dir.name
+                parent_sid = AUTO_PREFIX + parent_uuid
+
+                for agent_jsonl in subagents_dir.glob("agent-*.jsonl"):
+                    try:
+                        mtime = agent_jsonl.stat().st_mtime
+                        age = now_ts - mtime
+                        if age > IDLE_THRESHOLD_SEC:
+                            continue
+
+                        agent_id = agent_jsonl.stem  # e.g. "agent-a34fbb0c3a222503e"
+                        slug = _extract_slug(agent_jsonl)
+                        thread_name = slug if slug else agent_id
+                        task = _extract_last_user_message(agent_jsonl)
+                        status = "Running" if age < ACTIVE_THRESHOLD_SEC else "Idle"
+                        mtime_iso = datetime.fromtimestamp(mtime, tz=timezone.utc).isoformat()
+
+                        if parent_sid not in detected_threads:
+                            detected_threads[parent_sid] = {}
+                        detected_threads[parent_sid][agent_id] = {
+                            "thread_id": agent_id,
+                            "name": thread_name,
+                            "task": task,
+                            "status": status,
+                            "risk": "-",
+                            "mtime_iso": mtime_iso,
+                        }
+                    except Exception:
+                        continue
     except Exception:
         return
 
@@ -440,6 +502,40 @@ def scan_claude_sessions():
                     started=info["mtime_iso"],
                     last_seen=info["mtime_iso"],
                 )
+
+        # Apply detected subagent threads to their parent sessions
+        for parent_sid, threads in detected_threads.items():
+            if parent_sid not in sessions:
+                continue
+            parent = sessions[parent_sid]
+            for tid, tinfo in threads.items():
+                if tid in parent.threads:
+                    t = parent.threads[tid]
+                    t.task = tinfo["task"]
+                    t.status = tinfo["status"]
+                    t.last_seen = tinfo["mtime_iso"]
+                else:
+                    parent.threads[tid] = Thread(
+                        thread_id=tid,
+                        name=tinfo["name"],
+                        task=tinfo["task"],
+                        status=tinfo["status"],
+                        risk=tinfo["risk"],
+                        started=tinfo["mtime_iso"],
+                        last_seen=tinfo["mtime_iso"],
+                    )
+            # Remove auto-detected threads no longer in this scan
+            auto_tids = set(threads.keys())
+            stale = [t for t in parent.threads if t.startswith("agent-") and t not in auto_tids]
+            for t in stale:
+                del parent.threads[t]
+
+        # Clean up subagent threads from sessions with no detected subagents
+        for sid in sessions:
+            if sid.startswith(AUTO_PREFIX) and sid not in detected_threads:
+                stale = [t for t in sessions[sid].threads if t.startswith("agent-")]
+                for t in stale:
+                    del sessions[sid].threads[t]
 
         # Remove auto-detected sessions that are no longer active
         to_remove = []
