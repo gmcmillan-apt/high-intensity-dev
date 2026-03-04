@@ -255,6 +255,12 @@ def get_sessions_json():
             _railway_cache["ts"] = now
         railway_stats = _railway_cache["data"]
 
+        # ElevenLabs usage (cached 60s)
+        if now - _elevenlabs_cache["ts"] > 60:
+            _elevenlabs_cache["data"] = _get_elevenlabs_usage()
+            _elevenlabs_cache["ts"] = now
+        elevenlabs_stats = _elevenlabs_cache["data"]
+
         return {
             "sessions": result,
             "expired": list(expired[-10:]),
@@ -265,6 +271,7 @@ def get_sessions_json():
             "usage": agg_usage,
             "system": sys_stats,
             "railway": railway_stats,
+            "elevenlabs": elevenlabs_stats,
             "timestamp": now_iso(),
         }
 
@@ -618,6 +625,50 @@ def _get_railway_stats() -> dict:
     except Exception:
         pass
     return stats
+
+
+# ElevenLabs usage tracking
+def _load_elevenlabs_key() -> str:
+    """Load ElevenLabs API key from env or gus-demo-r1 .env file."""
+    key = os.environ.get("ELEVENLABS_API_KEY", "")
+    if key:
+        return key
+    # Fallback: read from sibling project's .env
+    env_path = Path(__file__).resolve().parent.parent.parent / "gus-demo-r1" / "backend" / ".env"
+    try:
+        for line in env_path.read_text().splitlines():
+            if line.startswith("ELEVENLABS_API_KEY="):
+                return line.split("=", 1)[1].strip()
+    except Exception:
+        pass
+    return ""
+
+ELEVENLABS_API_KEY = _load_elevenlabs_key()
+_elevenlabs_cache = {"data": {}, "ts": 0}
+
+
+def _get_elevenlabs_usage() -> dict:
+    """Fetch ElevenLabs character usage via subscription API."""
+    from urllib.request import Request, urlopen
+    result = {"used": 0, "limit": 0, "pct": 0, "tier": ""}
+    if not ELEVENLABS_API_KEY:
+        return result
+    try:
+        req = Request(
+            "https://api.elevenlabs.io/v1/user/subscription",
+            headers={"xi-api-key": ELEVENLABS_API_KEY},
+        )
+        with urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode())
+        used = data.get("character_count", 0)
+        limit = data.get("character_limit", 0)
+        result["used"] = used
+        result["limit"] = limit
+        result["pct"] = round(used / limit * 100) if limit else 0
+        result["tier"] = data.get("tier", "")
+    except Exception:
+        pass
+    return result
 
 
 def _scan_wt_tabs():
@@ -1105,6 +1156,11 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   .count-badge.system .num.crit { color: #f85149; }
   .count-badge.railway .num { color: #58a6ff; font-size: 16px; }
   .count-badge.railway .label { font-size: 11px; }
+  .count-badge.elevenlabs .num { font-size: 16px; }
+  .count-badge.elevenlabs .label { font-size: 11px; }
+  .count-badge.elevenlabs .num.ok { color: #3fb950; }
+  .count-badge.elevenlabs .num.warn { color: #d29922; }
+  .count-badge.elevenlabs .num.crit { color: #f85149; }
   table {
     width: 100%;
     border-collapse: collapse;
@@ -1540,7 +1596,7 @@ function fmtTokens(n) {
 function pctClass(v) { return v >= 90 ? 'crit' : v >= 70 ? 'warn' : 'ok'; }
 
 function renderTable(data) {
-  const { sessions, expired, counts, usage, system, railway } = data;
+  const { sessions, expired, counts, usage, system, railway, elevenlabs } = data;
 
   // Counts + Usage + System + Railway
   const countsEl = document.getElementById('counts');
@@ -1568,6 +1624,7 @@ function renderTable(data) {
     <div class="count-badge railway"><span class="num">${rwFe.cpu||0}%</span><span class="label">RW FE CPU</span></div>
     <div class="count-badge railway"><span class="num">${rwFe.mem_mb||0}</span><span class="label">MB FE RAM</span></div>
     <div class="count-badge railway"><span class="num">${rwEst.net_tx_gb||0}</span><span class="label">GB egress</span></div>
+    ${(() => { const el = elevenlabs || {}; if (!el.limit) return ''; const fmtK = v => v >= 1000000 ? (v/1000000).toFixed(1)+'M' : v >= 1000 ? (v/1000).toFixed(1)+'K' : v; return `<div class="counts-divider"></div><div class="count-badge elevenlabs"><span class="num ${pctClass(el.pct||0)}">${fmtK(el.used)} / ${fmtK(el.limit)}</span><span class="label">chars (${el.pct||0}%) ElevenLabs</span></div>`; })()}
   `;
 
   // Warning banner
