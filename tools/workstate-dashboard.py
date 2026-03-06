@@ -19,17 +19,20 @@ import json
 import os
 import threading
 import time
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
+import subprocess
 from urllib.parse import urlparse
+
+# Hide console windows spawned by subprocess on Windows
+_NO_WINDOW = subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0
 
 # Set at startup by --logo/--logo-left/--logo-right flags
 LOGO_DATA_URI = ""       # header logo (--logo)
 GUS_LOGO_URI = ""        # header right logo (gusai_logo.png)
 LOGO_LEFT_URI = ""       # bottom-left watermark (--logo-left)
-LOGO_RIGHT_URI = ""      # bottom-right watermark (--logo-right)
 
 
 # ---------------------------------------------------------------------------
@@ -86,7 +89,7 @@ def seconds_since(iso_str):
         dt = datetime.fromisoformat(iso_str)
         return (datetime.now(timezone.utc) - dt).total_seconds()
     except Exception:
-        return 0
+        return 99999
 
 
 def staleness(last_seen):
@@ -242,23 +245,8 @@ def get_sessions_json():
                 agg_usage[k] += s.usage.get(k, 0)
         agg_usage["cost_usd"] = round(agg_usage["cost_usd"], 4)
 
-        # System stats (cached 10s)
-        now = time.time()
-        if now - _system_stats_cache["ts"] > 10:
-            _system_stats_cache["data"] = _get_system_stats()
-            _system_stats_cache["ts"] = now
         sys_stats = _system_stats_cache["data"]
-
-        # Railway stats (cached 30s)
-        if now - _railway_cache["ts"] > 30:
-            _railway_cache["data"] = _get_railway_stats()
-            _railway_cache["ts"] = now
         railway_stats = _railway_cache["data"]
-
-        # ElevenLabs usage (cached 60s)
-        if now - _elevenlabs_cache["ts"] > 60:
-            _elevenlabs_cache["data"] = _get_elevenlabs_usage()
-            _elevenlabs_cache["ts"] = now
         elevenlabs_stats = _elevenlabs_cache["data"]
 
         return {
@@ -282,27 +270,26 @@ def get_sessions_json():
 
 def sweeper():
     while True:
-        time.sleep(30)
-        with lock:
-            # Sessions NEVER auto-expire. Only explicit Done/Delete removes them.
-            # An idle session just means the user hasn't talked to that tab yet.
+        try:
+            time.sleep(30)
+            with lock:
+                # Threads (subagents) auto-expire after EXPIRE_SECONDS
+                for sid, s in sessions.items():
+                    to_remove = []
+                    for tid, t in s.threads.items():
+                        if seconds_since(t.last_seen) > EXPIRE_SECONDS:
+                            to_remove.append(tid)
+                    for tid in to_remove:
+                        del s.threads[tid]
 
-            # Threads (subagents) DO auto-expire after EXPIRE_SECONDS —
-            # a silent subagent is probably dead.
-            for sid, s in sessions.items():
-                to_remove = []
-                for tid, t in s.threads.items():
-                    if seconds_since(t.last_seen) > EXPIRE_SECONDS:
-                        to_remove.append(tid)
-                for tid in to_remove:
-                    del s.threads[tid]
-
-            # Purge old expired entries (from Done/Delete) after PURGE_SECONDS
-            cutoff = PURGE_SECONDS
-            expired[:] = [
-                e for e in expired
-                if seconds_since(e.get("expired_at", now_iso())) < cutoff
-            ]
+                # Purge old expired entries after PURGE_SECONDS
+                cutoff = PURGE_SECONDS
+                expired[:] = [
+                    e for e in expired
+                    if seconds_since(e.get("expired_at", now_iso())) < cutoff
+                ]
+        except Exception:
+            pass  # never let the sweeper die
 
 
 # ---------------------------------------------------------------------------
@@ -311,7 +298,7 @@ def sweeper():
 
 CLAUDE_PROJECTS_DIR = Path.home() / ".claude" / "projects"
 ACTIVE_THRESHOLD_SEC = 300  # sessions modified in last 5 min = active
-IDLE_THRESHOLD_SEC = 7200   # sessions modified in last 2 hours = idle
+IDLE_THRESHOLD_SEC = 86400  # sessions modified in last 24 hours considered
 AUTO_PREFIX = "auto-cc-"    # prefix for auto-detected session IDs
 
 def _get_boot_time() -> float:
@@ -329,11 +316,11 @@ SYSTEM_BOOT_TIME = _get_boot_time()
 def _count_claude_processes() -> int:
     """Count running claude.exe processes."""
     try:
-        import subprocess
         r = subprocess.run(
             ["wmic", "process", "where", "name='claude.exe'", "get",
              "ProcessId", "/FORMAT:CSV"],
             capture_output=True, text=True, timeout=5, errors="replace",
+            creationflags=_NO_WINDOW,
         )
         count = 0
         for line in r.stdout.strip().splitlines():
@@ -514,7 +501,6 @@ def _extract_usage(jsonl_path: Path) -> dict:
 def _get_system_stats() -> dict:
     """Get CPU, memory, and disk usage."""
     import shutil
-    import subprocess
     stats = {"cpu_pct": 0, "mem_pct": 0, "mem_used_gb": 0, "mem_total_gb": 0,
              "disk_pct": 0, "disk_used_gb": 0, "disk_total_gb": 0}
     # Disk via stdlib (always works)
@@ -539,6 +525,7 @@ def _get_system_stats() -> dict:
         r = subprocess.run(
             ["powershell.exe", "-NoProfile", "-Command", ps_cmd],
             capture_output=True, text=True, timeout=8, errors="replace",
+            creationflags=_NO_WINDOW,
         )
         if r.stdout.strip():
             d = json.loads(r.stdout.strip())
@@ -554,11 +541,26 @@ def _get_system_stats() -> dict:
         pass
     return stats
 
-# Cache system stats (refresh every 10s to avoid hammering wmic)
+# Cache system stats (refreshed by background thread)
 _system_stats_cache = {"data": {}, "ts": 0}
 
 # Railway integration
-RAILWAY_TOKEN = os.environ.get("RAILWAY_TOKEN", "cd22118e-5590-4599-972a-0f74a1c746d9")
+def _load_env_token(key: str) -> str:
+    """Load a token from env var or tools/.env file."""
+    val = os.environ.get(key, "")
+    if val:
+        return val
+    env_file = Path(__file__).resolve().parent / ".env"
+    try:
+        for line in env_file.read_text().splitlines():
+            line = line.strip()
+            if line.startswith(f"{key}="):
+                return line.split("=", 1)[1].strip()
+    except Exception:
+        pass
+    return ""
+
+RAILWAY_TOKEN = _load_env_token("RAILWAY_TOKEN")
 RAILWAY_PROJECT_ID = "8798273c-5bcf-4be7-8111-959295307ada"
 RAILWAY_ENV_ID = "26f2c503-c4f0-4801-a4e5-5b14c0eac065"
 RAILWAY_SERVICES = {
@@ -571,7 +573,6 @@ _railway_cache = {"data": {}, "ts": 0}
 
 def _get_railway_stats() -> dict:
     """Fetch Railway service metrics + estimated usage via GraphQL API."""
-    import subprocess
     from urllib.request import Request, urlopen
     stats = {"backend": {"cpu": 0, "mem_mb": 0}, "frontend": {"cpu": 0, "mem_mb": 0},
              "estimated": {"cpu_hrs": 0, "mem_gb_hrs": 0, "net_tx_gb": 0}}
@@ -673,7 +674,6 @@ def _get_elevenlabs_usage() -> dict:
 
 def _scan_wt_tabs():
     """Get WT tab names + build claude_creation_ts -> tab_name mapping."""
-    import subprocess
 
     # Step 1: Tab names via UI Automation
     ps_cmd = (
@@ -696,6 +696,7 @@ def _scan_wt_tabs():
         r = subprocess.run(
             ["powershell.exe", "-NoProfile", "-Command", ps_cmd],
             capture_output=True, text=True, timeout=15, errors="replace",
+            creationflags=_NO_WINDOW,
         )
         if r.stdout.strip():
             tab_names = json.loads(r.stdout.strip())
@@ -712,6 +713,7 @@ def _scan_wt_tabs():
             ["wmic", "process", "where", "name='WindowsTerminal.exe'", "get",
              "ProcessId", "/FORMAT:CSV"],
             capture_output=True, text=True, timeout=5, errors="replace",
+            creationflags=_NO_WINDOW,
         )
         for line in r.stdout.strip().splitlines():
             parts = [p.strip() for p in line.split(",") if p.strip()]
@@ -728,6 +730,7 @@ def _scan_wt_tabs():
                  f"name='pwsh.exe' and ParentProcessId={wt_pid}",
                  "get", "ProcessId,CreationDate", "/FORMAT:CSV"],
                 capture_output=True, text=True, timeout=10, errors="replace",
+                creationflags=_NO_WINDOW,
             )
             for line in r.stdout.strip().splitlines():
                 parts = [p.strip() for p in line.split(",") if p.strip()]
@@ -755,6 +758,7 @@ def _scan_wt_tabs():
             ["wmic", "process", "where", "name='claude.exe'", "get",
              "ProcessId,ParentProcessId,CreationDate", "/FORMAT:CSV"],
             capture_output=True, text=True, timeout=10, errors="replace",
+            creationflags=_NO_WINDOW,
         )
         for line in r.stdout.strip().splitlines():
             parts = [p.strip() for p in line.split(",") if p.strip()]
@@ -815,19 +819,8 @@ def scan_claude_sessions():
                     name = first_msg if first_msg != "Claude Code" else project_label
                     name = f"[{project_label}] {name}"
 
-                    # Match JSONL to WT tab: find the latest claude.exe
-                    # that started BEFORE this JSONL was created (one claude
-                    # per tab persists across conversations).
+                    # Tab matching is done after all JSONLs are collected
                     tab_label = ""
-                    try:
-                        jctime = jsonl.stat().st_ctime  # Windows = birth time
-                        # claude_info sorted by creation epoch
-                        ci_sorted = sorted(claude_info, key=lambda x: x[1])
-                        for _cpid, cepoch, tidx, tname in ci_sorted:
-                            if cepoch <= jctime + 5:  # 5s grace
-                                tab_label = f"Tab {tidx}: {tname}"
-                    except Exception:
-                        pass
 
                     usage = _extract_usage(jsonl)
 
@@ -896,6 +889,44 @@ def scan_claude_sessions():
         ranked = sorted(detected.items(),
                         key=lambda kv: kv[1].get("mtime_iso", ""), reverse=True)
         detected = dict(ranked[:max(n_procs, 0)])
+
+    # 1:1 tab assignment (after ghost cap so we only match active sessions).
+    if claude_info:
+        pairs = []
+        sid_ctimes = {}
+        for sid in detected:
+            jsonl_stem = sid[len(AUTO_PREFIX):]
+            try:
+                for pdir in CLAUDE_PROJECTS_DIR.iterdir():
+                    jpath = pdir / f"{jsonl_stem}.jsonl"
+                    if jpath.exists():
+                        jctime = jpath.stat().st_ctime
+                        sid_ctimes[sid] = jctime
+                        for ci_idx, (_cpid, cepoch, _tidx, _tname) in enumerate(claude_info):
+                            if cepoch <= jctime + 5:
+                                gap = abs(jctime - cepoch)
+                                pairs.append((gap, sid, ci_idx))
+                        break
+            except Exception:
+                continue
+        pairs.sort(key=lambda x: x[0])
+        used_claudes = set()
+        used_sids = set()
+        for gap, sid, ci_idx in pairs:
+            if sid in used_sids or ci_idx in used_claudes:
+                continue
+            _cpid, _cepoch, tidx, tname = claude_info[ci_idx]
+            detected[sid]["tab"] = f"Tab {tidx}: {tname}"
+            used_claudes.add(ci_idx)
+            used_sids.add(sid)
+        # Assign remaining unmatched sessions to remaining tabs
+        unmatched_sids = sorted(
+            [s for s in detected if s not in used_sids],
+            key=lambda s: sid_ctimes.get(s, 0))
+        unmatched_tabs = [i for i in range(len(claude_info)) if i not in used_claudes]
+        for sid, ci_idx in zip(unmatched_sids, unmatched_tabs):
+            _cpid, _cepoch, tidx, tname = claude_info[ci_idx]
+            detected[sid]["tab"] = f"Tab {tidx}: {tname}"
 
     with lock:
         # Update or create auto-detected sessions
@@ -976,8 +1007,30 @@ def scan_claude_sessions():
 def session_scanner():
     """Background thread that periodically scans for Claude Code sessions."""
     while True:
-        scan_claude_sessions()
-        time.sleep(10)  # scan every 10 seconds
+        try:
+            scan_claude_sessions()
+        except Exception:
+            pass  # never let the scanner die
+        time.sleep(10)
+
+
+def cache_refresher():
+    """Background thread that refreshes external API caches outside the lock."""
+    while True:
+        try:
+            now = time.time()
+            if now - _system_stats_cache["ts"] > 10:
+                _system_stats_cache["data"] = _get_system_stats()
+                _system_stats_cache["ts"] = now
+            if now - _railway_cache["ts"] > 30:
+                _railway_cache["data"] = _get_railway_stats()
+                _railway_cache["ts"] = now
+            if now - _elevenlabs_cache["ts"] > 60:
+                _elevenlabs_cache["data"] = _get_elevenlabs_usage()
+                _elevenlabs_cache["ts"] = now
+        except Exception:
+            pass  # never let the cache refresher die
+        time.sleep(10)
 
 
 # ---------------------------------------------------------------------------
@@ -993,9 +1046,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
         elif path == "/api/sessions":
             self._json_response(get_sessions_json(), 200)
         elif path == "/api/launch-pwsh":
-            import subprocess
-            subprocess.Popen(["wt", "new-tab", "pwsh"], creationflags=0x00000008)
-            self._json_response({"ok": True}, 200)
+            try:
+                subprocess.Popen(["wt", "new-tab", "pwsh"], creationflags=_NO_WINDOW)
+                self._json_response({"ok": True}, 200)
+            except Exception as e:
+                self._json_response({"error": str(e)}, 500)
         else:
             self._json_response({"error": "Not found"}, 404)
 
@@ -1004,7 +1059,13 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if path == "/api/session":
             try:
                 length = int(self.headers.get("Content-Length", 0))
+                if length > 1_000_000:
+                    self._json_response({"error": "Payload too large"}, 413)
+                    return
                 body = json.loads(self.rfile.read(length)) if length else {}
+                if not isinstance(body, dict):
+                    self._json_response({"error": "Expected JSON object"}, 400)
+                    return
             except (json.JSONDecodeError, ValueError):
                 self._json_response({"error": "Invalid JSON"}, 400)
                 return
@@ -1036,7 +1097,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _cors_headers(self):
-        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Origin", "http://localhost:7777")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type")
 
@@ -1047,8 +1108,6 @@ class DashboardHandler(BaseHTTPRequestHandler):
         html = html.replace("{{GUS_LOGO_DISPLAY}}", "block" if GUS_LOGO_URI else "none")
         html = html.replace("{{LOGO_LEFT_URI}}", LOGO_LEFT_URI)
         html = html.replace("{{LOGO_LEFT_DISPLAY}}", "block" if LOGO_LEFT_URI else "none")
-        html = html.replace("{{LOGO_RIGHT_URI}}", LOGO_RIGHT_URI)
-        html = html.replace("{{LOGO_RIGHT_DISPLAY}}", "block" if LOGO_RIGHT_URI else "none")
         body = html.encode()
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -1328,6 +1387,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   .service-dot-online { background: #3fb950; box-shadow: 0 0 8px #3fb95066; }
   .service-dot-offline { background: #f85149; box-shadow: 0 0 8px #f8514966; animation: pulse-dot 1.5s ease-in-out infinite; }
   .service-dot-checking { background: #d29922; box-shadow: 0 0 6px #d2992266; animation: pulse-dot 1s ease-in-out infinite; }
+  .service-dot-degraded { background: #d29922; box-shadow: 0 0 8px #d2992266; }
   @keyframes pulse-dot { 0%,100% { opacity: 1; } 50% { opacity: 0.4; } }
   .service-info { display: flex; flex-direction: column; }
   .service-name { font-size: 13px; font-weight: 600; color: #e6edf3; }
@@ -1337,6 +1397,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   .service-label-online { color: #3fb950; }
   .service-label-offline { color: #f85149; }
   .service-label-checking { color: #d29922; }
+  .service-label-degraded { color: #d29922; }
   .service-latency { font-size: 10px; color: #484f58; }
 
   /* Local pages grid */
@@ -1391,7 +1452,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     pointer-events: none;
     z-index: 999;
   }
-  .watermark-right { right: 24px; }
   .watermark-left { left: 24px; }
   .watermark img {
     width: 600px;
@@ -1459,6 +1519,37 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       <div class="service-status">
         <div class="service-label service-label-checking" id="svc-wbe-label">Checking...</div>
         <div class="service-latency" id="svc-wbe-latency"></div>
+      </div>
+    </div>
+    <div style="width:1px;background:#21262d;margin:4px 0"></div>
+    <div class="service-card" id="svc-claude-api">
+      <div class="service-dot service-dot-checking" id="svc-capi-dot"></div>
+      <div class="service-info">
+        <span class="service-name">Claude API</span>
+        <span class="service-url">api.anthropic.com</span>
+      </div>
+      <div class="service-status">
+        <div class="service-label service-label-checking" id="svc-capi-label">Checking...</div>
+      </div>
+    </div>
+    <div class="service-card" id="svc-claude-code">
+      <div class="service-dot service-dot-checking" id="svc-ccode-dot"></div>
+      <div class="service-info">
+        <span class="service-name">Claude Code</span>
+        <span class="service-url">status.claude.com</span>
+      </div>
+      <div class="service-status">
+        <div class="service-label service-label-checking" id="svc-ccode-label">Checking...</div>
+      </div>
+    </div>
+    <div class="service-card" id="svc-claude-ai">
+      <div class="service-dot service-dot-checking" id="svc-cai-dot"></div>
+      <div class="service-info">
+        <span class="service-name">claude.ai</span>
+        <span class="service-url">claude.ai</span>
+      </div>
+      <div class="service-status">
+        <div class="service-label service-label-checking" id="svc-cai-label">Checking...</div>
       </div>
     </div>
   </div>
@@ -1548,9 +1639,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   <div id="expired-section"></div>
   <div class="watermark watermark-left" style="display:{{LOGO_LEFT_DISPLAY}}">
     <img src="{{LOGO_LEFT_URI}}" alt="">
-  </div>
-  <div class="watermark watermark-right" style="display:{{LOGO_RIGHT_DISPLAY}}">
-    <img src="{{LOGO_RIGHT_URI}}" alt="">
   </div>
 
 <script>
@@ -1785,6 +1873,35 @@ async function checkWebServices() {
 
 checkWebServices();
 setInterval(checkWebServices, 15000);
+
+// Claude status (status.claude.com Statuspage API)
+const CLAUDE_COMPONENTS = {
+  'k8w3r06qmzrp': 'capi',   // Claude API
+  'yyzkbfz2thpt': 'ccode',  // Claude Code
+  'rwppv331jlwc': 'cai',    // claude.ai
+};
+function updateClaudeStatus(key, status) {
+  const dot = document.getElementById('svc-' + key + '-dot');
+  const label = document.getElementById('svc-' + key + '-label');
+  if (!dot || !label) return;
+  const isOp = status === 'operational';
+  const isDeg = status === 'degraded_performance' || status === 'partial_outage';
+  dot.className = 'service-dot ' + (isOp ? 'service-dot-online' : isDeg ? 'service-dot-degraded' : 'service-dot-offline');
+  label.className = 'service-label ' + (isOp ? 'service-label-online' : isDeg ? 'service-label-degraded' : 'service-label-offline');
+  label.textContent = isOp ? 'Operational' : isDeg ? 'Degraded' : status === 'major_outage' ? 'Outage' : status.replace(/_/g, ' ');
+}
+async function checkClaudeStatus() {
+  try {
+    const r = await fetch('https://status.claude.com/api/v2/summary.json', { signal: AbortSignal.timeout(10000) });
+    const d = await r.json();
+    for (const c of (d.components || [])) {
+      const key = CLAUDE_COMPONENTS[c.id];
+      if (key) updateClaudeStatus(key, c.status);
+    }
+  } catch { /* silent */ }
+}
+checkClaudeStatus();
+setInterval(checkClaudeStatus, 60000);
 </script>
 </body>
 </html>
@@ -1814,7 +1931,7 @@ def load_logo(path_str):
 
 
 def main():
-    global LOGO_DATA_URI, GUS_LOGO_URI, LOGO_LEFT_URI, LOGO_RIGHT_URI
+    global LOGO_DATA_URI, GUS_LOGO_URI, LOGO_LEFT_URI
 
     parser = argparse.ArgumentParser(
         description="Workstate Dashboard - local multi-session status aggregator"
@@ -1822,7 +1939,6 @@ def main():
     parser.add_argument("--port", type=int, default=7777, help="Port (default: 7777)")
     parser.add_argument("--logo", type=str, default="", help="Path to header logo image")
     parser.add_argument("--logo-left", type=str, default="", help="Path to bottom-left logo image")
-    parser.add_argument("--logo-right", type=str, default="", help="Path to bottom-right logo image")
     args = parser.parse_args()
 
     # Auto-load images from tools/images/ folder if no flags given
@@ -1842,13 +1958,6 @@ def main():
             if candidate.exists():
                 args.logo_left = str(candidate)
                 break
-    if not args.logo_right and images_dir.exists():
-        for ext in ("png", "jpg", "jpeg", "svg", "webp"):
-            candidate = images_dir / f"logo-right.{ext}"
-            if candidate.exists():
-                args.logo_right = str(candidate)
-                break
-
     if args.logo:
         LOGO_DATA_URI = load_logo(args.logo)
         if LOGO_DATA_URI:
@@ -1866,30 +1975,21 @@ def main():
         LOGO_LEFT_URI = load_logo(args.logo_left)
         if LOGO_LEFT_URI:
             print(f"Left logo loaded: {args.logo_left}")
-    if args.logo_right:
-        LOGO_RIGHT_URI = load_logo(args.logo_right)
-        if LOGO_RIGHT_URI:
-            print(f"Right logo loaded: {args.logo_right}")
-
-    if not any([LOGO_DATA_URI, LOGO_LEFT_URI, LOGO_RIGHT_URI]):
+    if not any([LOGO_DATA_URI, LOGO_LEFT_URI]):
         print(f"Tip: Drop images into {images_dir}/ to add logos:")
         print(f"  logo.png       -> header logo")
         print(f"  logo-left.png  -> bottom-left watermark")
-        print(f"  logo-right.png -> bottom-right watermark")
 
-    # Start sweeper thread
-    t = threading.Thread(target=sweeper, daemon=True)
-    t.start()
-
-    # Start Claude Code session scanner
-    scanner = threading.Thread(target=session_scanner, daemon=True)
-    scanner.start()
+    # Start background threads
+    threading.Thread(target=sweeper, daemon=True).start()
+    threading.Thread(target=session_scanner, daemon=True).start()
+    threading.Thread(target=cache_refresher, daemon=True).start()
     print(f"Claude Code session scanner active (scanning {CLAUDE_PROJECTS_DIR})")
 
     # Do initial scan immediately
     scan_claude_sessions()
 
-    server = ThreadingHTTPServer(("", args.port), DashboardHandler)
+    server = ThreadingHTTPServer(("127.0.0.1", args.port), DashboardHandler)
     print(f"Workstate Dashboard: http://localhost:{args.port}")
     print("Press Ctrl+C to stop.")
 
