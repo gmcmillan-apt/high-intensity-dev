@@ -3,6 +3,7 @@ import json
 import runpy
 import shutil
 import sys
+import time
 import unittest
 import uuid
 from pathlib import Path
@@ -32,6 +33,14 @@ class WorkstateDashboardTests(unittest.TestCase):
         self.original_probe_statuspage_service = self.globals["_probe_statuspage_service"]
         self.original_fetch_statuspage_summary = self.globals["_fetch_statuspage_summary"]
         self.original_json_loads = self.globals["json"].loads
+        self.original_subprocess_run = self.globals["subprocess"].run
+        self.original_scan_wt_tabs = self.globals["_scan_wt_tabs"]
+        self.original_count_claude_processes = self.globals["_count_claude_processes"]
+        self.original_get_transcript_summary = self.globals["_get_transcript_summary"]
+        self.original_claude_projects_dir = self.globals["CLAUDE_PROJECTS_DIR"]
+        self.original_system_boot_time = self.globals["SYSTEM_BOOT_TIME"]
+        self.original_active_threshold = self.globals["ACTIVE_THRESHOLD_SEC"]
+        self.original_idle_threshold = self.globals["IDLE_THRESHOLD_SEC"]
 
     def tearDown(self):
         self.globals["WARN_SECONDS"] = self.original_warn_seconds
@@ -46,6 +55,14 @@ class WorkstateDashboardTests(unittest.TestCase):
         self.globals["_probe_statuspage_service"] = self.original_probe_statuspage_service
         self.globals["_fetch_statuspage_summary"] = self.original_fetch_statuspage_summary
         self.globals["json"].loads = self.original_json_loads
+        self.globals["subprocess"].run = self.original_subprocess_run
+        self.globals["_scan_wt_tabs"] = self.original_scan_wt_tabs
+        self.globals["_count_claude_processes"] = self.original_count_claude_processes
+        self.globals["_get_transcript_summary"] = self.original_get_transcript_summary
+        self.globals["CLAUDE_PROJECTS_DIR"] = self.original_claude_projects_dir
+        self.globals["SYSTEM_BOOT_TIME"] = self.original_system_boot_time
+        self.globals["ACTIVE_THRESHOLD_SEC"] = self.original_active_threshold
+        self.globals["IDLE_THRESHOLD_SEC"] = self.original_idle_threshold
 
     def test_staleness_thresholds(self):
         now_iso = self.mod["now_iso"]()
@@ -157,6 +174,64 @@ class WorkstateDashboardTests(unittest.TestCase):
         self.assertEqual(result["summary"]["online"], expected_count)
         self.assertEqual(result["summary"]["degraded"], 0)
         self.assertEqual(result["summary"]["offline"], 0)
+
+    def test_count_claude_processes_excludes_desktop_app(self):
+        payload = [
+            {
+                "Id": 16216,
+                "Path": (
+                    "C:\\Program Files\\WindowsApps\\"
+                    "Claude_1.1.4498.0_x64__pzs8sxrjxfjjc\\app\\Claude.exe"
+                ),
+            },
+            {"Id": 35864, "Path": "C:\\Users\\gmcmillan\\.local\\bin\\claude.exe"},
+            {"Id": 88088, "Path": None},
+        ]
+
+        def fake_run(*args, **kwargs):
+            return type("Result", (), {"stdout": json.dumps(payload)})()
+
+        self.globals["subprocess"].run = fake_run
+
+        self.assertEqual(self.mod["_count_claude_processes"](), 1)
+
+    def test_scan_claude_sessions_prefers_tab_backed_claude_code_sessions(self):
+        tmpdir = Path(__file__).resolve().parent / f"tmp-transcript-{uuid.uuid4().hex}"
+        project_dir = tmpdir / "C--Users-gmcmillan-Desktop-AI-Projects-ACV-AI-Agent-demo"
+        project_dir.mkdir(parents=True)
+        first = project_dir / f"{uuid.uuid4()}.jsonl"
+        first.write_text("first\n", encoding="utf-8")
+        time.sleep(1.1)
+        second = project_dir / f"{uuid.uuid4()}.jsonl"
+        second.write_text("second\n", encoding="utf-8")
+
+        try:
+            self.globals["CLAUDE_PROJECTS_DIR"] = tmpdir
+            self.globals["SYSTEM_BOOT_TIME"] = 0
+            self.globals["ACTIVE_THRESHOLD_SEC"] = 999999
+            self.globals["IDLE_THRESHOLD_SEC"] = 999999
+            self.globals["_count_claude_processes"] = lambda: 4
+            self.globals["_scan_wt_tabs"] = lambda: [
+                (123, second.stat().st_ctime, 0, "Claude Code")
+            ]
+            self.globals["_get_transcript_summary"] = lambda path: {
+                "first_user_message": f"name-{path.stem}",
+                "last_user_message": f"task-{path.stem}",
+                "slug": "",
+                "usage": {},
+            }
+
+            self.mod["scan_claude_sessions"]()
+
+            auto_sessions = [
+                session
+                for session in self.globals["sessions"].values()
+                if session.session_id.startswith(self.globals["AUTO_PREFIX"])
+            ]
+            self.assertEqual(len(auto_sessions), 1)
+            self.assertIn("Claude Code", auto_sessions[0].tab)
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
 
     def test_transcript_summary_cache_reuses_unchanged_file(self):
         lines = [

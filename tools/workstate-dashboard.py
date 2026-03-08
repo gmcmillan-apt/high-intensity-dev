@@ -337,21 +337,39 @@ def _get_boot_time() -> float:
 SYSTEM_BOOT_TIME = _get_boot_time()
 
 
+def _is_claude_code_executable(path: str) -> bool:
+    """Return True for Claude Code CLI binaries, not the desktop Claude app."""
+    if not path:
+        return False
+    normalized = path.replace("/", "\\").lower()
+    if not normalized.endswith("\\claude.exe"):
+        return False
+    if "\\windowsapps\\claude_" in normalized:
+        return False
+    return True
+
+
 def _count_claude_processes() -> int:
-    """Count running claude.exe processes."""
+    """Count running Claude Code CLI processes, excluding the desktop app."""
+    ps_cmd = (
+        "$procs = @(Get-Process claude -ErrorAction SilentlyContinue | "
+        "Select-Object Id,Path);"
+        "if($procs.Count -eq 0){'[]'} else {$procs | ConvertTo-Json -Compress}"
+    )
     try:
         r = subprocess.run(
-            ["wmic", "process", "where", "name='claude.exe'", "get",
-             "ProcessId", "/FORMAT:CSV"],
+            ["powershell.exe", "-NoProfile", "-Command", ps_cmd],
             capture_output=True, text=True, timeout=5, errors="replace",
             creationflags=_NO_WINDOW,
         )
-        count = 0
-        for line in r.stdout.strip().splitlines():
-            parts = [p.strip() for p in line.split(",") if p.strip()]
-            if parts and parts[-1].isdigit():
-                count += 1
-        return count
+        items = json.loads(r.stdout.strip() or "[]")
+        if isinstance(items, dict):
+            items = [items]
+        return sum(
+            1
+            for item in items
+            if _is_claude_code_executable(item.get("Path", ""))
+        )
     except Exception:
         return -1  # unknown — don't cap
 
@@ -1016,16 +1034,6 @@ def scan_claude_sessions():
     except Exception:
         return
 
-    # Cap detected sessions to the number of running claude.exe processes.
-    # After a reboot, stale JSONL files may have post-boot mtimes (from
-    # session init) but no live process — this prevents ghost sessions.
-    n_procs = _count_claude_processes()
-    if n_procs >= 0 and len(detected) > n_procs:
-        # Keep only the N most recently modified sessions
-        ranked = sorted(detected.items(),
-                        key=lambda kv: kv[1].get("mtime_iso", ""), reverse=True)
-        detected = dict(ranked[:max(n_procs, 0)])
-
     # 1:1 tab assignment (after ghost cap so we only match active sessions).
     if claude_info:
         pairs = []
@@ -1063,6 +1071,24 @@ def scan_claude_sessions():
         for sid, ci_idx in zip(unmatched_sids, unmatched_tabs):
             _cpid, _cepoch, tidx, tname = claude_info[ci_idx]
             detected[sid]["tab"] = f"Tab {tidx}: {tname}"
+
+    # Cap detected sessions to the number of live Claude Code processes.
+    # Prefer sessions that are mapped to visible WT tabs when available.
+    n_procs = _count_claude_processes()
+    if claude_info:
+        visible_tabs = len(claude_info)
+        n_procs = visible_tabs if n_procs <= 0 else min(n_procs, visible_tabs)
+    if n_procs >= 0 and len(detected) > n_procs:
+        matched = []
+        unmatched = []
+        for item in detected.items():
+            if item[1].get("tab"):
+                matched.append(item)
+            else:
+                unmatched.append(item)
+        matched.sort(key=lambda kv: kv[1].get("mtime_iso", ""), reverse=True)
+        unmatched.sort(key=lambda kv: kv[1].get("mtime_iso", ""), reverse=True)
+        detected = dict((matched + unmatched)[:max(n_procs, 0)])
 
     with lock:
         # Update or create auto-detected sessions
